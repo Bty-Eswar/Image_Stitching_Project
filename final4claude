@@ -1,0 +1,199 @@
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+def largest_interior_rectangle(mask):
+    """
+    Find the largest rectangle that fits entirely within the non-black region.
+    Uses a histogram-based approach (similar to 'largest rectangle in histogram').
+    This eliminates ALL black borders completely.
+    """
+    h, w = mask.shape
+    heights = np.zeros(w, dtype=np.int32)
+    best = (0, 0, 0, 0)  # (x, y, w, h)
+    best_area = 0
+
+    for row in range(h):
+        # Update histogram heights
+        for col in range(w):
+            heights[col] = heights[col] + 1 if mask[row, col] else 0
+
+        # Largest rectangle in this histogram row
+        stack = []
+        for col in range(w + 1):
+            current_h = heights[col] if col < w else 0
+            start = col
+            while stack and stack[-1][1] > current_h:
+                s_col, s_h = stack.pop()
+                area = s_h * (col - s_col)
+                if area > best_area:
+                    best_area = area
+                    best = (s_col, row - s_h + 1, col - s_col, s_h)
+                start = s_col
+            stack.append((start, current_h))
+
+    return best  # (x, y, w, h)
+
+
+def feathered_blend(img1, img2, mask1, mask2):
+    """
+    Feathered (gradient) blending in the overlap region.
+    Creates a smooth transition instead of a hard 50/50 cut.
+    """
+    overlap = mask1 & mask2
+
+    # Distance transform — pixels near img2's edge get weight 0, centre get weight 1
+    dist1 = cv2.distanceTransform(mask1.astype(np.uint8), cv2.DIST_L2, 5)
+    dist2 = cv2.distanceTransform(mask2.astype(np.uint8), cv2.DIST_L2, 5)
+
+    # Normalize weights so they sum to 1 in the overlap
+    total = dist1 + dist2
+    total[total == 0] = 1  # avoid division by zero
+
+    alpha = dist1 / total  # weight for img1
+
+    # Build output
+    panorama = np.zeros_like(img1, dtype=np.float32)
+
+    # Only img1 region
+    only1 = mask1 & ~mask2
+    panorama[only1] = img1[only1]
+
+    # Only img2 region
+    only2 = mask2 & ~mask1
+    panorama[only2] = img2[only2]
+
+    # Blended overlap
+    for c in range(3):
+        a = alpha[overlap]
+        panorama[overlap, c] = (img1[overlap, c] * a +
+                                img2[overlap, c] * (1 - a))
+
+    return panorama.astype(np.uint8)
+
+
+# ---------------------------------------------------------
+# 1. LOAD IMAGES
+# ---------------------------------------------------------
+img1 = cv2.imread("dataset/image33.jpg")   # Left image
+img2 = cv2.imread("dataset/image44.jpg")   # Right image
+
+if img1 is None or img2 is None:
+    print("Error: Images not found! Check your paths.")
+    exit()
+
+gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
+gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
+
+# ---------------------------------------------------------
+# 2. FEATURE DETECTION — SIFT
+# ---------------------------------------------------------
+sift = cv2.SIFT_create()
+kp1, des1 = sift.detectAndCompute(gray1, None)
+kp2, des2 = sift.detectAndCompute(gray2, None)
+print(f"Keypoints — Image 1: {len(kp1)}, Image 2: {len(kp2)}")
+
+# ---------------------------------------------------------
+# 3. FEATURE MATCHING — BF + Lowe's Ratio Test
+# ---------------------------------------------------------
+bf = cv2.BFMatcher()
+matches = bf.knnMatch(des1, des2, k=2)
+
+good_matches = [m for m, n in matches if m.distance < 0.75 * n.distance]
+print(f"Good matches after ratio test: {len(good_matches)}")
+
+matched_img = cv2.drawMatches(img1, kp1, img2, kp2, good_matches, None, flags=2)
+
+# ---------------------------------------------------------
+# 4. HOMOGRAPHY & WARPING
+# ---------------------------------------------------------
+if len(good_matches) > 10:
+    src_pts = np.float32([kp1[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+    dst_pts = np.float32([kp2[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+
+    H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+
+    h1, w1 = img1.shape[:2]
+    h2, w2 = img2.shape[:2]
+
+    corners_img1 = np.float32([[0, 0], [0, h1], [w1, h1], [w1, 0]]).reshape(-1, 1, 2)
+    corners_img2 = np.float32([[0, 0], [0, h2], [w2, h2], [w2, 0]]).reshape(-1, 1, 2)
+
+    warped_corners = cv2.perspectiveTransform(corners_img1, H)
+    all_corners = np.concatenate((warped_corners, corners_img2), axis=0)
+
+    [xmin, ymin] = np.int32(all_corners.min(axis=0).ravel())
+    [xmax, ymax] = np.int32(all_corners.max(axis=0).ravel())
+
+    translation_dist = [-xmin, -ymin]
+    T = np.array([[1, 0, translation_dist[0]],
+                  [0, 1, translation_dist[1]],
+                  [0, 0, 1]])
+
+    canvas_w, canvas_h = xmax - xmin, ymax - ymin
+
+    warped_img1 = cv2.warpPerspective(img1, T @ H, (canvas_w, canvas_h))
+
+    warped_img2 = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+    warped_img2[translation_dist[1]:h2 + translation_dist[1],
+                translation_dist[0]:w2 + translation_dist[0]] = img2
+
+    # ---------------------------------------------------------
+    # 5. FEATHERED BLENDING  ← key fix
+    # ---------------------------------------------------------
+    mask1 = cv2.cvtColor(warped_img1, cv2.COLOR_BGR2GRAY) > 0
+    mask2 = cv2.cvtColor(warped_img2, cv2.COLOR_BGR2GRAY) > 0
+
+    panorama = feathered_blend(warped_img1, warped_img2, mask1, mask2)
+
+    # ---------------------------------------------------------
+    # 6. CROP TO LARGEST INTERIOR RECTANGLE  ← key fix
+    # ---------------------------------------------------------
+    combined_mask = (cv2.cvtColor(panorama, cv2.COLOR_BGR2GRAY) > 0)
+    x, y, w, h = largest_interior_rectangle(combined_mask)
+
+    if w > 0 and h > 0:
+        final_output = panorama[y:y + h, x:x + w]
+        print(f"Cropped to interior rectangle: x={x}, y={y}, w={w}, h={h}")
+    else:
+        # Fallback: simple bounding-box crop
+        contours, _ = cv2.findContours(
+            combined_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        bx, by, bw, bh = cv2.boundingRect(max(contours, key=cv2.contourArea))
+        final_output = panorama[by:by + bh, bx:bx + bw]
+        print("Fallback bounding-box crop used.")
+
+    # ---------------------------------------------------------
+    # 7. DISPLAY
+    # ---------------------------------------------------------
+    plt.figure(figsize=(15, 10))
+
+    plt.subplot(2, 2, 1)
+    plt.imshow(cv2.cvtColor(img1, cv2.COLOR_BGR2RGB))
+    plt.title("Image 1 (Left)")
+    plt.axis('off')
+
+    plt.subplot(2, 2, 2)
+    plt.imshow(cv2.cvtColor(img2, cv2.COLOR_BGR2RGB))
+    plt.title("Image 2 (Right)")
+    plt.axis('off')
+
+    plt.subplot(2, 2, 3)
+    plt.imshow(cv2.cvtColor(matched_img, cv2.COLOR_BGR2RGB))
+    plt.title(f"Matches ({len(good_matches)})")
+    plt.axis('off')
+
+    plt.subplot(2, 2, 4)
+    plt.imshow(cv2.cvtColor(final_output, cv2.COLOR_BGR2RGB))
+    plt.title("Final Stitched Panorama (No Black Regions)")
+    plt.axis('off')
+
+    plt.tight_layout()
+    plt.savefig("panorama_result.png", dpi=150, bbox_inches='tight')
+    plt.show()
+
+    print("Saved: panorama_result.png")
+
+else:
+    print("Not enough matches found to stitch!")

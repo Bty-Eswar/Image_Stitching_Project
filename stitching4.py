@@ -177,7 +177,7 @@ if len(good_matches) > 10:
 
     x,y,w,h = cv2.boundingRect(coords)
 
-    cropped = result[y:y+h, x:x+w]
+    cropped = blended[y:y+h, x:x+w]
 
 
 
@@ -197,6 +197,7 @@ if len(good_matches) > 10:
     ax[1].axis("off")
 
     plt.show()
+     
 
 else:
     print("Not enough matches found!")
