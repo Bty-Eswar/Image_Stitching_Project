@@ -3,8 +3,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 # Load images
-img1 = cv2.imread("dataset/image11.jpg")
-img2 = cv2.imread("dataset/image22.jpg")
+img1 = cv2.imread("dataset/image33.jpg")
+img2 = cv2.imread("dataset/image44.jpg")
 
 # Check if loaded
 if img1 is None or img2 is None:
@@ -14,6 +14,11 @@ if img1 is None or img2 is None:
 # Convert to grayscale
 gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
 gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
+
+cv2.imshow("Image 1", gray1)
+cv2.imshow("Image 2", gray2)     
+cv2.waitKey(0)
+cv2.destroyAllWindows()
 
 # Create SIFT detector
 sift = cv2.SIFT_create()

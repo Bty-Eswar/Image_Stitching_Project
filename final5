@@ -1,0 +1,258 @@
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+from skimage.metrics import structural_similarity as ssim_func
+
+
+# =============================================================
+# UTILITY: Crop to bounding box of non-black region
+# =============================================================
+def safe_crop_panorama(image):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    _, thresh = cv2.threshold(gray, 1, 255, cv2.THRESH_BINARY)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return image
+    c = max(contours, key=cv2.contourArea)
+    x, y, w, h = cv2.boundingRect(c)
+    return image[y:y+h, x:x+w]
+
+
+# =============================================================
+# SECTION 5: PERFORMANCE EVALUATION METRICS
+# (Paper equations 7–14)
+# =============================================================
+
+def compute_mse(img1, img2):
+    """Equation (14) — Mean Squared Error"""
+    img1 = img1.astype(np.float64)
+    img2 = img2.astype(np.float64)
+    return np.mean((img1 - img2) ** 2)
+
+def compute_psnr(img1, img2):
+    """Equation (7) — Peak Signal to Noise Ratio"""
+    mse = compute_mse(img1, img2)
+    if mse == 0:
+        return float('inf')
+    R = 255.0
+    return 10 * np.log10((R ** 2) / mse)
+
+def compute_rmse(img1, img2):
+    """Equation (9) — Root Mean Square Error"""
+    return np.sqrt(compute_mse(img1, img2))
+
+def compute_ssim(img1, img2):
+    """Equation (8) — Structural Similarity Index"""
+    # Convert to grayscale for SSIM
+    g1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
+    g2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
+    score, _ = ssim_func(g1, g2, full=True)
+    return score
+
+def compute_uiqi(img1, img2):
+    """
+    Equation (13) — Universal Image Quality Index
+    UIQI = (4 * mu_x * mu_y * sigma_xy) / ((mu_x^2 + mu_y^2) * (sigma_x^2 + sigma_y^2))
+    Computed per channel, then averaged.
+    """
+    img1 = img1.astype(np.float64)
+    img2 = img2.astype(np.float64)
+    uiqi_channels = []
+    for c in range(3):
+        x = img1[:, :, c]
+        y = img2[:, :, c]
+        mu_x = np.mean(x)
+        mu_y = np.mean(y)
+        sigma_x2 = np.var(x)
+        sigma_y2 = np.var(y)
+        sigma_xy = np.mean((x - mu_x) * (y - mu_y))
+        denom = (mu_x**2 + mu_y**2) * (sigma_x2 + sigma_y2)
+        if denom == 0:
+            uiqi_channels.append(1.0)
+        else:
+            uiqi_channels.append((4 * mu_x * mu_y * sigma_xy) / denom)
+    return np.mean(uiqi_channels)
+
+def evaluate_metrics(original, stitched):
+    """
+    Resize stitched to match original for metric computation,
+    then compute all 5 paper metrics.
+    """
+    ref = cv2.resize(original, (stitched.shape[1], stitched.shape[0]))
+    psnr  = compute_psnr(ref, stitched)
+    ssim  = compute_ssim(ref, stitched)
+    rmse  = compute_rmse(ref, stitched)
+    mse   = compute_mse(ref, stitched)
+    uiqi  = compute_uiqi(ref, stitched)
+    return psnr, ssim, rmse, mse, uiqi
+
+
+# =============================================================
+# SECTION 4.1: PREPROCESSING — Load & convert to grayscale
+# =============================================================
+img1 = cv2.imread("dataset/img2.jpg")   # Left image
+img2 = cv2.imread("dataset/img1.jpg")   # Right image
+
+if img1 is None or img2 is None:
+    print("Error: Images not found! Check your paths.")
+    exit()
+
+# Preprocessing: convert color images to grayscale (Paper Section 4.1)
+gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
+gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
+
+
+# =============================================================
+# SECTION 4.1: FEATURE DETECTION — SIFT
+# SIFT detects corners, blobs, etc. and produces 128-dim descriptor
+# =============================================================
+sift = cv2.SIFT_create()
+kp1, des1 = sift.detectAndCompute(gray1, None)
+kp2, des2 = sift.detectAndCompute(gray2, None)
+
+print(f"Keypoints — Image 1: {len(kp1)}, Image 2: {len(kp2)}")
+
+
+# =============================================================
+# SECTION 4.2: FEATURE MATCHING — BF Matcher + KNN
+# Threshold = 0.8 as stated in the paper (Section 4.2)
+# =============================================================
+bf = cv2.BFMatcher()
+matches = bf.knnMatch(des1, des2, k=2)   # k=2 as per paper
+
+# Lowe's Ratio Test — threshold = 0.8 (Paper Section 4.2)
+good_matches = []
+for m, n in matches:
+    if m.distance < 0.8 * n.distance:   # ← 0.8 as per paper
+        good_matches.append(m)
+
+print(f"Good matches after ratio test (threshold=0.8): {len(good_matches)}")
+
+matched_img = cv2.drawMatches(img1, kp1, img2, kp2, good_matches, None, flags=2)
+
+
+# =============================================================
+# SECTION 4.3: RANSAC — Outlier Removal & Homography
+# =============================================================
+if len(good_matches) > 10:
+    src_pts = np.float32([kp1[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+    dst_pts = np.float32([kp2[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+
+    # RANSAC computes homography and removes outliers (Paper Section 4.3)
+    H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+
+    inliers = int(mask.sum())
+    print(f"RANSAC inliers: {inliers} / {len(good_matches)}")
+
+
+    # =============================================================
+    # SECTION 4.4: IMAGE WARPING — Perspective Warping
+    # =============================================================
+    h1, w1 = img1.shape[:2]
+    h2, w2 = img2.shape[:2]
+
+    corners_img1 = np.float32([[0,0],[0,h1],[w1,h1],[w1,0]]).reshape(-1,1,2)
+    corners_img2 = np.float32([[0,0],[0,h2],[w2,h2],[w2,0]]).reshape(-1,1,2)
+
+    warped_corners = cv2.perspectiveTransform(corners_img1, H)
+    all_corners = np.concatenate((warped_corners, corners_img2), axis=0)
+
+    [xmin, ymin] = np.int32(all_corners.min(axis=0).ravel())
+    [xmax, ymax] = np.int32(all_corners.max(axis=0).ravel())
+
+    translation_dist = [-xmin, -ymin]
+    T = np.array([[1, 0, translation_dist[0]],
+                  [0, 1, translation_dist[1]],
+                  [0, 0, 1]])
+
+    canvas_w = xmax - xmin
+    canvas_h = ymax - ymin
+
+    # Perspective warp img1 onto canvas
+    warped_img1 = cv2.warpPerspective(img1, T @ H, (canvas_w, canvas_h))
+
+    # Place img2 on canvas
+    warped_img2 = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+    warped_img2[translation_dist[1]:h2+translation_dist[1],
+                translation_dist[0]:w2+translation_dist[0]] = img2
+
+
+    # =============================================================
+    # SECTION 4.4: ALPHA BLENDING — equation (6): I = αI1 + (1-α)I2
+    # Paper uses simple average blending with α = 0.5
+    # =============================================================
+    mask1 = cv2.cvtColor(warped_img1, cv2.COLOR_BGR2GRAY) > 0
+    mask2 = cv2.cvtColor(warped_img2, cv2.COLOR_BGR2GRAY) > 0
+    overlap = mask1 & mask2
+
+    alpha = 0.5   # Paper equation (6), α = 0.5
+
+    panorama = warped_img1.copy()
+
+    # Where only img2 exists
+    panorama[~mask1] = warped_img2[~mask1]
+
+    # Overlap region: I = α*I1 + (1-α)*I2  [Equation 6]
+    panorama[overlap] = (
+        warped_img1[overlap] * alpha +
+        warped_img2[overlap] * (1 - alpha)
+    ).astype(np.uint8)
+
+    # Crop black borders
+    final_output = safe_crop_panorama(panorama)
+
+
+    # =============================================================
+    # SECTION 5: PERFORMANCE EVALUATION METRICS
+    # PSNR, SSIM, RMSE, MSE, UIQI (Table 1 in paper)
+    # Uses img2 (reference/right image) as the ground truth reference
+    # =============================================================
+    psnr, ssim, rmse, mse, uiqi = evaluate_metrics(img2, final_output)
+
+    print("\n" + "="*45)
+    print("  PERFORMANCE EVALUATION METRICS (Paper Table 1)")
+    print("="*45)
+    print(f"  PSNR  : {psnr:.2f} dB  (higher = better, target 30–50 dB)")
+    print(f"  SSIM  : {ssim:.4f}    (higher = better, max = 1.0)")
+    print(f"  RMSE  : {rmse:.2f}      (lower  = better)")
+    print(f"  MSE   : {mse:.2f}    (lower  = better)")
+    print(f"  UIQI  : {uiqi:.4f}    (higher = better, max = 1.0)")
+    print("="*45)
+
+
+    # =============================================================
+    # DISPLAY RESULTS
+    # =============================================================
+    fig = plt.figure(figsize=(16, 10))
+
+    plt.subplot(2, 3, 1)
+    plt.imshow(cv2.cvtColor(img1, cv2.COLOR_BGR2RGB))
+    plt.title("(a) Input Image 1")
+    plt.axis('off')
+
+    plt.subplot(2, 3, 2)
+    plt.imshow(cv2.cvtColor(img2, cv2.COLOR_BGR2RGB))
+    plt.title("(b) Input Image 2")
+    plt.axis('off')
+
+    plt.subplot(2, 3, 3)
+    plt.imshow(cv2.cvtColor(matched_img, cv2.COLOR_BGR2RGB))
+    plt.title(f"(c) Matching Feature Points ({len(good_matches)})")
+    plt.axis('off')
+
+    plt.subplot(2, 1, 2)
+    plt.imshow(cv2.cvtColor(final_output, cv2.COLOR_BGR2RGB))
+    plt.title(
+        f"(d) Final Stitched Panorama\n"
+        f"PSNR={psnr:.2f}dB | SSIM={ssim:.4f} | RMSE={rmse:.2f} | MSE={mse:.2f} | UIQI={uiqi:.4f}"
+    )
+    plt.axis('off')
+
+    plt.tight_layout()
+    plt.savefig("panorama_result.png", dpi=150, bbox_inches='tight')
+    plt.show()
+
+    print("\nSaved: panorama_result.png")
+
+else:
+    print("Not enough matches found to stitch!")

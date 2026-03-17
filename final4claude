@@ -100,7 +100,7 @@ print(f"Keypoints — Image 1: {len(kp1)}, Image 2: {len(kp2)}")
 bf = cv2.BFMatcher()
 matches = bf.knnMatch(des1, des2, k=2)
 
-good_matches = [m for m, n in matches if m.distance < 0.75 * n.distance]
+good_matches = [m for m, n in matches if m.distance < 0.8 * n.distance]
 print(f"Good matches after ratio test: {len(good_matches)}")
 
 matched_img = cv2.drawMatches(img1, kp1, img2, kp2, good_matches, None, flags=2)
