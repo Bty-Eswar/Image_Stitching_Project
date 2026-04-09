@@ -1,0 +1,620 @@
+"""
+============================================================
+SEAMLESS PANORAMIC IMAGE STITCHING
+Based on: "Seamless Panoramic Image Stitching Based on Invariant
+Feature Detector and Image Blending"
+by Megha V. and Rajkumar K.K.
+Published in I.J. Image, Graphics and Signal Processing, 2024, 4, 30-41
+
+Paper Modules:
+  Module 1: Feature Detection using SIFT
+  Module 2: Feature Matching using Brute-Force Matcher with KNN
+  Module 3: Outlier Detection using RANSAC
+  Module 4: Image Warping and Alpha Blending
+
+Metrics: PSNR, SSIM, RMSE, MSE, UIQI
+============================================================
+"""
+
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import os
+import sys
+from math import log10, sqrt
+
+
+# ─────────────────────────────────────────────────────────
+# UTILITY: show an image inline in matplotlib
+# ─────────────────────────────────────────────────────────
+def show(title, img, cmap=None):
+    plt.figure(figsize=(10, 5))
+    if len(img.shape) == 2 or cmap == 'gray':
+        plt.imshow(img, cmap='gray')
+    else:
+        plt.imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    plt.title(title, fontsize=14, fontweight='bold')
+    plt.axis('off')
+    plt.tight_layout()
+    plt.savefig(f"output_{title.replace(' ', '_').replace('/', '_')}.png",
+                dpi=120, bbox_inches='tight')
+    plt.show()
+    print(f"  [Saved] output_{title.replace(' ', '_').replace('/', '_')}.png")
+
+
+# ═══════════════════════════════════════════════════════════
+# MODULE 1 — FEATURE DETECTION USING SIFT
+# Paper Section 4.1
+# ═══════════════════════════════════════════════════════════
+def module1_feature_detection(img1_bgr, img2_bgr):
+    """
+    Steps (paper §4.1):
+      1. Convert color images to grayscale (preprocessing)
+      2. Build scale-space using Gaussian convolution  L(x,y,σ) = G(x,y,σ)*I(x,y)
+      3. Compute Difference-of-Gaussian (DoG)          D(x,y) = L(x,y,kσ) − L(x,y,σ)
+      4. Detect scale-space extrema (key points)
+      5. Eliminate low-contrast + edge key points
+      6. Assign orientation to each key point
+      7. Build 128-dim feature descriptor (4×4 cells × 8-bin histogram = 128)
+    """
+    print("\n" + "="*60)
+    print("MODULE 1: FEATURE DETECTION USING SIFT")
+    print("="*60)
+
+    # ── Step 1: Preprocessing – convert to grayscale (paper §4.1)
+    print("\n[Step 1] Converting color images to grayscale (preprocessing)")
+    gray1 = cv2.cvtColor(img1_bgr, cv2.COLOR_BGR2GRAY)
+    gray2 = cv2.cvtColor(img2_bgr, cv2.COLOR_BGR2GRAY)
+    print(f"  Image 1 original shape : {img1_bgr.shape}")
+    print(f"  Image 1 grayscale shape: {gray1.shape}")
+    print(f"  Image 2 original shape : {img2_bgr.shape}")
+    print(f"  Image 2 grayscale shape: {gray2.shape}")
+
+    # Show grayscale images
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    axes[0].imshow(gray1, cmap='gray'); axes[0].set_title("Gray Image 1"); axes[0].axis('off')
+    axes[1].imshow(gray2, cmap='gray'); axes[1].set_title("Gray Image 2"); axes[1].axis('off')
+    plt.suptitle("Step 1 Output: Grayscale Conversion", fontweight='bold')
+    plt.tight_layout()
+    plt.savefig("output_Step1_Grayscale.png", dpi=120, bbox_inches='tight')
+    plt.show()
+
+    # ── Step 2–7: SIFT feature detection + descriptor extraction
+    # SIFT implements all paper steps:
+    # scale-space → DoG → extrema → key point localization →
+    # orientation assignment → 128-dim descriptor
+    print("\n[Step 2-7] SIFT: Scale-Space → DoG → Extrema → Orientation → Descriptor")
+    sift = cv2.SIFT_create()
+    kp1, des1 = sift.detectAndCompute(gray1, None)
+    kp2, des2 = sift.detectAndCompute(gray2, None)
+
+    print(f"\n  Key points detected in Image 1 : {len(kp1)}")
+    print(f"  Key points detected in Image 2 : {len(kp2)}")
+    print(f"  Descriptor length per keypoint  : {des1.shape[1]}  (4×4 cells × 8-bin = 128)")
+
+    # Draw key points on images
+    img1_kp = cv2.drawKeypoints(gray1, kp1, None,
+                                flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+    img2_kp = cv2.drawKeypoints(gray2, kp2, None,
+                                flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    axes[0].imshow(img1_kp, cmap='gray')
+    axes[0].set_title(f"Image 1 — {len(kp1)} Key Points"); axes[0].axis('off')
+    axes[1].imshow(img2_kp, cmap='gray')
+    axes[1].set_title(f"Image 2 — {len(kp2)} Key Points"); axes[1].axis('off')
+    plt.suptitle("Step 2-7 Output: SIFT Key Points (scale + orientation shown)", fontweight='bold')
+    plt.tight_layout()
+    plt.savefig("output_Step2_7_SIFT_Keypoints.png", dpi=120, bbox_inches='tight')
+    plt.show()
+
+    # Print descriptor statistics (paper mentions 128-dim vector)
+    print(f"\n  Descriptor matrix shape (Image 1): {des1.shape}  [N keypoints × 128 dims]")
+    print(f"  Descriptor matrix shape (Image 2): {des2.shape}")
+    print(f"  Sample descriptor (first 16 dims of kp1[0]):\n  {des1[0, :16]}")
+
+    return kp1, des1, kp2, des2
+
+
+# ═══════════════════════════════════════════════════════════
+# MODULE 2 — FEATURE MATCHING: Brute-Force + KNN
+# Paper Section 4.2
+# ═══════════════════════════════════════════════════════════
+def module2_feature_matching(img1_bgr, img2_bgr, kp1, des1, kp2, des2):
+    """
+    Steps (paper §4.2):
+      1. Brute-Force (BF) matcher: compare every descriptor in img1
+         against every descriptor in img2 using distance measure.
+      2. KNN with k=2: find 2 nearest neighbours for each descriptor.
+      3. Lowe's ratio test with threshold = 0.8 (paper §4.2):
+         If dist(nearest) / dist(2nd nearest) < 0.8 → good match, else discard.
+      4. Sort inliers by descriptor distance.
+    """
+    print("\n" + "="*60)
+    print("MODULE 2: FEATURE MATCHING — BF Matcher with KNN")
+    print("="*60)
+
+    # ── Step 1-2: BF Matcher + kNN (k=2) as stated in paper
+    print("\n[Step 1-2] Brute-Force Matcher with KNN (k=2)")
+    bf = cv2.BFMatcher(cv2.NORM_L2)          # L2 distance for SIFT (paper §4.2)
+    matches_knn = bf.knnMatch(des1, des2, k=2)   # k=2 as specified in paper
+    print(f"  Total KNN match pairs found: {len(matches_knn)}")
+
+    # ── Step 3: Lowe's ratio test — threshold = 0.8 (paper §4.2)
+    print("\n[Step 3] Lowe Ratio Test (threshold = 0.8 as per paper §4.2)")
+    good_matches = []
+    for m, n in matches_knn:
+        if m.distance < 0.8 * n.distance:   # threshold = 0.8 from paper
+            good_matches.append(m)
+    good_matches = sorted(good_matches, key=lambda x: x.distance)  # sort by distance
+
+    print(f"  Matches after ratio test: {len(good_matches)}")
+    print(f"  Discarded (outlier candidates): {len(matches_knn) - len(good_matches)}")
+    if good_matches:
+        print(f"  Best match distance : {good_matches[0].distance:.4f}")
+        print(f"  Worst match distance: {good_matches[-1].distance:.4f}")
+
+    # ── Step 4: Visualise all good matches
+    img_matches = cv2.drawMatches(img1_bgr, kp1, img2_bgr, kp2,
+                                  good_matches[:80], None,
+                                  flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
+    show("Module 2 — BF+KNN Feature Matches (top 80)", img_matches)
+
+    return good_matches
+
+
+# ═══════════════════════════════════════════════════════════
+# MODULE 3 — OUTLIER DETECTION USING RANSAC
+# Paper Section 4.3
+# ═══════════════════════════════════════════════════════════
+def module3_ransac_outlier_detection(img1_bgr, img2_bgr, kp1, kp2, good_matches):
+    """
+    Steps (paper §4.3):
+      RANSAC loop:
+        1. Choose random seed group of points.
+        2. Compute transformation matrix (Homography H).
+        3. Find inliers that fit the transformation.
+        4. If enough inliers, recompute least-squares H from all inliers.
+        5. Keep transformation with most inliers.
+      Returns: Homography matrix H, inlier mask, filtered match list
+    """
+    print("\n" + "="*60)
+    print("MODULE 3: RANSAC-BASED OUTLIER DETECTION")
+    print("="*60)
+
+    if len(good_matches) < 4:
+        raise ValueError("Need at least 4 matches to compute Homography.")
+
+    # Extract point coordinates from key point objects
+    src_pts = np.float32([kp1[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+    dst_pts = np.float32([kp2[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+
+    print(f"\n[Step 1-5] Running RANSAC to compute Homography H")
+    print(f"  Input matches to RANSAC: {len(good_matches)}")
+
+    # RANSAC as described in paper §4.3
+    H, mask = cv2.findHomography(src_pts, dst_pts,
+                                  cv2.RANSAC,
+                                  ransacReprojThreshold=5.0)
+    mask = mask.ravel()
+
+    inlier_matches  = [good_matches[i] for i in range(len(good_matches)) if mask[i] == 1]
+    outlier_matches = [good_matches[i] for i in range(len(good_matches)) if mask[i] == 0]
+
+    print(f"  Inliers  after RANSAC: {len(inlier_matches)}")
+    print(f"  Outliers removed      : {len(outlier_matches)}")
+    print(f"\n  Homography Matrix H:\n{H}")
+
+    # ── Visualise: inliers (green) vs outliers (red)
+    img_inliers = cv2.drawMatches(img1_bgr, kp1, img2_bgr, kp2,
+                                   inlier_matches[:60], None,
+                                   matchColor=(0, 255, 0),
+                                   flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
+    show("Module 3 — RANSAC Inliers (green, top 60)", img_inliers)
+
+    if outlier_matches:
+        img_outliers = cv2.drawMatches(img1_bgr, kp1, img2_bgr, kp2,
+                                        outlier_matches[:30], None,
+                                        matchColor=(0, 0, 255),
+                                        flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
+        show("Module 3 — RANSAC Outliers removed (red, top 30)", img_outliers)
+
+    return H, inlier_matches
+
+
+# ═══════════════════════════════════════════════════════════
+# MODULE 4 — IMAGE WARPING + ALPHA BLENDING
+# Paper Section 4.4
+# ═══════════════════════════════════════════════════════════
+def module4_warping_and_blending(img1_bgr, img2_bgr, H):
+    """
+    Steps (paper §4.4):
+      1. Perspective Warping:
+         - Compute perspective transformation from Homography H.
+         - Apply warpPerspective to img1 (source) into the coordinate frame of img2.
+      2. Alpha Blending (paper eq. 6):
+         I = α·I1 + (1−α)·I2   with  α = 0.5
+         - Overlapping region uses equal contribution from both images.
+         - α = 0.5 eliminates visible seams (paper §4.4).
+    """
+    print("\n" + "="*60)
+    print("MODULE 4: IMAGE WARPING + ALPHA BLENDING")
+    print("="*60)
+
+    h1, w1 = img1_bgr.shape[:2]
+    h2, w2 = img2_bgr.shape[:2]
+
+    # ── Step 1: Perspective Warping (paper §4.4)
+    print("\n[Step 1] Perspective Warping using Homography H")
+
+    # Compute bounding box of the warped image
+    corners_img1 = np.float32([[0,0],[w1,0],[w1,h1],[0,h1]]).reshape(-1,1,2)
+    corners_img2 = np.float32([[0,0],[w2,0],[w2,h2],[0,h2]]).reshape(-1,1,2)
+    warped_corners = cv2.perspectiveTransform(corners_img1, H)
+    all_corners = np.concatenate([corners_img2, warped_corners], axis=0)
+
+    [xmin, ymin] = np.int32(all_corners.min(axis=0).ravel() - 0.5)
+    [xmax, ymax] = np.int32(all_corners.max(axis=0).ravel() + 0.5)
+
+    # Translation to shift negative coordinates to positive
+    t = [-xmin, -ymin]
+    H_t = np.array([[1, 0, t[0]],
+                    [0, 1, t[1]],
+                    [0, 0, 1  ]], dtype=np.float64)
+
+    out_w = xmax - xmin
+    out_h = ymax - ymin
+    print(f"  Output canvas size: {out_w} × {out_h} pixels")
+
+    # Warp img1 onto the canvas
+    warped_img1 = cv2.warpPerspective(img1_bgr, H_t @ H, (out_w, out_h))
+
+    # Place img2 onto the canvas
+    canvas_img2 = np.zeros((out_h, out_w, 3), dtype=np.uint8)
+    canvas_img2[t[1]:t[1]+h2, t[0]:t[0]+w2] = img2_bgr
+
+    show("Module 4 Step 1a — Warped Image 1 (perspective warping)", warped_img1)
+    show("Module 4 Step 1b — Image 2 placed on canvas", canvas_img2)
+
+    # ── Step 2: Alpha Blending (paper eq. 6: I = α·I1 + (1−α)·I2, α=0.5)
+    print("\n[Step 2] Alpha Blending  →  I = α·I1 + (1−α)·I2  with α = 0.5")
+    alpha = 0.5   # paper §4.4: α = 0.5 for seam elimination
+
+    # Build masks to identify regions
+    mask_warped = (warped_img1.sum(axis=2) > 0).astype(np.float32)
+    mask_canvas = (canvas_img2.sum(axis=2) > 0).astype(np.float32)
+    overlap     = (mask_warped * mask_canvas)   # pixels present in BOTH images
+
+    # Construct the stitched image:
+    #   - Overlap region: I = 0.5·I1 + 0.5·I2  (paper eq. 6)
+    #   - Non-overlap:    take whichever image has pixels
+    stitched = np.zeros_like(warped_img1, dtype=np.float32)
+    for c in range(3):
+        w1_ch = warped_img1[:, :, c].astype(np.float32)
+        w2_ch = canvas_img2[:, :, c].astype(np.float32)
+        stitched[:, :, c] = (
+            overlap        * (alpha * w1_ch + (1 - alpha) * w2_ch) +  # overlap
+            (1 - overlap)  * mask_warped * w1_ch +                     # only img1
+            (1 - overlap)  * mask_canvas * w2_ch                       # only img2
+        )
+
+    stitched = np.clip(stitched, 0, 255).astype(np.uint8)
+
+    show("Module 4 Step 2 — Final Stitched Panorama (Alpha Blended α=0.5)", stitched)
+    print(f"  Final stitched image shape: {stitched.shape}")
+
+    # Show the overlap region highlighted
+    overlap_vis = canvas_img2.copy()
+    overlap_mask_3ch = np.stack([overlap]*3, axis=2).astype(np.uint8)
+    overlap_vis[overlap.astype(bool)] = [0, 255, 0]
+    show("Module 4 — Overlap Region (green)", overlap_vis)
+
+    return stitched, canvas_img2
+
+
+# ═══════════════════════════════════════════════════════════
+# PERFORMANCE EVALUATION METRICS
+# Paper Section 5 — PSNR, SSIM, RMSE, MSE, UIQI
+# ═══════════════════════════════════════════════════════════
+
+def compute_mse(img1, img2):
+    """MSE (paper eq. 14): MSE = Σ[I1(m,n)−I2(m,n)]² / (M×N)"""
+    img1 = img1.astype(np.float64)
+    img2 = img2.astype(np.float64)
+    M, N = img1.shape[:2]
+    return np.sum((img1 - img2) ** 2) / (M * N * (img1.shape[2] if img1.ndim == 3 else 1))
+
+
+def compute_psnr(img1, img2):
+    """PSNR (paper eq. 7): PSNR = 10·log10(R²/MSE), R=255 for 8-bit"""
+    mse = compute_mse(img1, img2)
+    if mse == 0:
+        return float('inf')
+    R = 255.0
+    return 10 * log10((R ** 2) / mse)
+
+
+def compute_rmse(img1, img2):
+    """RMSE (paper eq. 9): RMSE = sqrt(Σ(Pi−Oi)²/n)"""
+    return sqrt(compute_mse(img1, img2))
+
+
+def compute_ssim(img1, img2):
+    """
+    SSIM (paper eq. 8):
+    SSIM(x,y) = (2μxμy+C1)(2σxy+C2) / (μx²+μy²+C1)(σx²+σy²+C2)
+    """
+    img1 = img1.astype(np.float64)
+    img2 = img2.astype(np.float64)
+
+    C1 = (0.01 * 255) ** 2
+    C2 = (0.03 * 255) ** 2
+
+    if img1.ndim == 3:
+        ssim_vals = []
+        for c in range(img1.shape[2]):
+            ssim_vals.append(_ssim_channel(img1[:,:,c], img2[:,:,c], C1, C2))
+        return np.mean(ssim_vals)
+    return _ssim_channel(img1, img2, C1, C2)
+
+
+def _ssim_channel(ch1, ch2, C1, C2):
+    mu_x   = np.mean(ch1)
+    mu_y   = np.mean(ch2)
+    sigma_x  = np.std(ch1)
+    sigma_y  = np.std(ch2)
+    sigma_xy = np.mean((ch1 - mu_x) * (ch2 - mu_y))
+    numerator   = (2*mu_x*mu_y + C1) * (2*sigma_xy + C2)
+    denominator = (mu_x**2 + mu_y**2 + C1) * (sigma_x**2 + sigma_y**2 + C2)
+    return numerator / denominator
+
+
+def compute_uiqi(img1, img2):
+    """
+    UIQI (paper eq. 10-13):
+    l(x,y) = 2μxμy / (μx²+μy²)
+    c(x,y) = 2σxσy / (σx²+σy²)
+    s(x,y) = σxy / (σx·σy)
+    UIQI = (4·μx·μy·σxy) / ((μx²+μy²)·(σx²+σy²))
+    """
+    img1 = img1.astype(np.float64)
+    img2 = img2.astype(np.float64)
+    if img1.ndim == 3:
+        uiqi_vals = [_uiqi_channel(img1[:,:,c], img2[:,:,c]) for c in range(img1.shape[2])]
+        return np.mean(uiqi_vals)
+    return _uiqi_channel(img1, img2)
+
+
+def _uiqi_channel(ch1, ch2):
+    mu_x   = np.mean(ch1)
+    mu_y   = np.mean(ch2)
+    sigma_x  = np.std(ch1)
+    sigma_y  = np.std(ch2)
+    sigma_xy = np.mean((ch1 - mu_x) * (ch2 - mu_y))
+    denom = (mu_x**2 + mu_y**2) * (sigma_x**2 + sigma_y**2)
+    if denom == 0:
+        return 0.0
+    return (4 * mu_x * mu_y * sigma_xy) / denom
+
+
+def evaluate_metrics(stitched, reference):
+    """
+    Compute all 5 metrics from paper §5 on the overlapping region.
+    Crops to the minimum common size for comparison.
+    """
+    print("\n" + "="*60)
+    print("PERFORMANCE EVALUATION METRICS (Paper §5)")
+    print("="*60)
+
+    h = min(stitched.shape[0], reference.shape[0])
+    w = min(stitched.shape[1], reference.shape[1])
+    s = stitched[:h, :w]
+    r = reference[:h, :w]
+
+    psnr  = compute_psnr(s, r)
+    ssim  = compute_ssim(s, r)
+    rmse  = compute_rmse(s, r)
+    mse   = compute_mse(s, r)
+    uiqi  = compute_uiqi(s, r)
+
+    print(f"\n  PSNR  (↑ better, range 30-50 dB): {psnr:.4f} dB")
+    print(f"  SSIM  (↑ better, range 0-1)      : {ssim:.4f}")
+    print(f"  RMSE  (↓ better)                  : {rmse:.4f}")
+    print(f"  MSE   (↓ better)                  : {mse:.4f}")
+    print(f"  UIQI  (↑ better, range 0-1)       : {uiqi:.4f}")
+
+    # Bar chart for metrics (similar to paper Fig. 5)
+    metrics = {'PSNR (dB)': psnr, 'SSIM': ssim*100, 'RMSE': rmse, 'MSE': mse/100, 'UIQI': uiqi*100}
+    fig, axes = plt.subplots(1, 5, figsize=(18, 4))
+    colors = ['steelblue', 'darkorange', 'tomato', 'purple', 'seagreen']
+    labels = ['PSNR\n(dB)', 'SSIM\n(×100)', 'RMSE', 'MSE\n(÷100)', 'UIQI\n(×100)']
+    vals   = [psnr, ssim*100, rmse, mse/100, uiqi*100]
+    for i, ax in enumerate(axes):
+        ax.bar(['Img Set'], [vals[i]], color=colors[i], width=0.4)
+        ax.set_title(labels[i], fontweight='bold')
+        ax.set_ylim(0, max(vals[i]*1.3, 0.1))
+        ax.text(0, vals[i]+vals[i]*0.05, f"{vals[i]:.2f}", ha='center', fontsize=10)
+    plt.suptitle("Performance Metrics (Paper §5 — Fig. 5 style)", fontweight='bold', fontsize=13)
+    plt.tight_layout()
+    plt.savefig("output_Performance_Metrics.png", dpi=120, bbox_inches='tight')
+    plt.show()
+
+    return {'PSNR': psnr, 'SSIM': ssim, 'RMSE': rmse, 'MSE': mse, 'UIQI': uiqi}
+
+
+# ═══════════════════════════════════════════════════════════
+# SUMMARY FIGURE — Paper Fig. 4 style
+# (Input1 | Input2 | Matching Features | Final Output)
+# ═══════════════════════════════════════════════════════════
+def paper_figure4(img1_bgr, img2_bgr, kp1, kp2, inlier_matches, stitched):
+    print("\n[Summary] Generating Paper Fig. 4 style output grid")
+    # Column c: matching feature points (inliers only)
+    match_img = cv2.drawMatches(img1_bgr, kp1, img2_bgr, kp2,
+                                inlier_matches[:50], None,
+                                matchColor=(0, 255, 0),
+                                flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
+
+    fig, axes = plt.subplots(1, 4, figsize=(22, 5))
+    titles = ["a) Input Image 1", "b) Input Image 2",
+              "c) Matching Feature Points", "d) Final Output"]
+    imgs   = [img1_bgr, img2_bgr, match_img, stitched]
+
+    for ax, title, img in zip(axes, titles, imgs):
+        ax.imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+        ax.set_title(title, fontweight='bold', fontsize=11)
+        ax.axis('off')
+
+    plt.suptitle("Paper Fig. 4 — Full Pipeline Output", fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig("output_Fig4_Summary_Grid.png", dpi=120, bbox_inches='tight')
+    plt.show()
+    print("  [Saved] output_Fig4_Summary_Grid.png")
+
+
+# ═══════════════════════════════════════════════════════════
+# MAIN PIPELINE
+# ═══════════════════════════════════════════════════════════
+def run_stitching_pipeline(image1_path, image2_path):
+    print("\n" + "╔"+"═"*58+"╗")
+    print("║  SEAMLESS PANORAMIC IMAGE STITCHING PIPELINE            ║")
+    print("║  Paper: Megha V. & Rajkumar K.K., IJIGSP 2024          ║")
+    print("╚"+"═"*58+"╝")
+
+    # ── Load Images
+    print(f"\n[Loading] Image 1: {image1_path}")
+    print(f"[Loading] Image 2: {image2_path}")
+
+    img1 = cv2.imread(image1_path)
+    img2 = cv2.imread(image2_path)
+
+    if img1 is None or img2 is None:
+        print("\nERROR: Could not load one or both images.")
+        print("  Please update image1_path and image2_path below.")
+        return
+
+    # Resize to 512×512 as used in paper (UDIS dataset images are 512×512)
+    img1 = cv2.resize(img1, (512, 512))
+    img2 = cv2.resize(img2, (512, 512))
+    print(f"  Images resized to 512×512 (as per UDIS dataset in paper §6)")
+
+    # Show input images
+    fig, ax = plt.subplots(1, 2, figsize=(12, 5))
+    ax[0].imshow(cv2.cvtColor(img1, cv2.COLOR_BGR2RGB)); ax[0].set_title("Input Image 1"); ax[0].axis('off')
+    ax[1].imshow(cv2.cvtColor(img2, cv2.COLOR_BGR2RGB)); ax[1].set_title("Input Image 2"); ax[1].axis('off')
+    plt.suptitle("Input Images", fontweight='bold'); plt.tight_layout()
+    plt.savefig("output_Input_Images.png", dpi=120, bbox_inches='tight'); plt.show()
+
+    # ── Module 1: SIFT Feature Detection
+    kp1, des1, kp2, des2 = module1_feature_detection(img1, img2)
+
+    # ── Module 2: BF + KNN Feature Matching
+    good_matches = module2_feature_matching(img1, img2, kp1, des1, kp2, des2)
+
+    # ── Module 3: RANSAC Outlier Detection
+    H, inlier_matches = module3_ransac_outlier_detection(img1, img2, kp1, kp2, good_matches)
+
+    # ── Module 4: Warping + Alpha Blending
+    stitched, canvas_img2 = module4_warping_and_blending(img1, img2, H)
+
+    # ── Performance Metrics
+    metrics = evaluate_metrics(stitched, canvas_img2)
+
+    # ── Paper Fig. 4 Summary
+    paper_figure4(img1, img2, kp1, kp2, inlier_matches, stitched)
+
+    # ── Final Summary
+    print("\n" + "="*60)
+    print("PIPELINE COMPLETE — SUMMARY")
+    print("="*60)
+    print(f"  Key points (Image 1)  : {len(kp1)}")
+    print(f"  Key points (Image 2)  : {len(kp2)}")
+    print(f"  Matches after KNN     : {len(good_matches)}")
+    print(f"  Inliers after RANSAC  : {len(inlier_matches)}")
+    print(f"  Final panorama shape  : {stitched.shape}")
+    print(f"  PSNR  : {metrics['PSNR']:.4f} dB  (paper typical: 30-50 dB)")
+    print(f"  SSIM  : {metrics['SSIM']:.4f}     (1 = perfect)")
+    print(f"  RMSE  : {metrics['RMSE']:.4f}")
+    print(f"  MSE   : {metrics['MSE']:.4f}")
+    print(f"  UIQI  : {metrics['UIQI']:.4f}     (1 = perfect)")
+
+    # Save stitched result
+    cv2.imwrite("output_Final_Stitched_Panorama.jpg", stitched)
+    print("\n  Final panorama saved: output_Final_Stitched_Panorama.jpg")
+    print("\n  All step-by-step outputs saved as output_*.png files")
+
+
+# ═══════════════════════════════════════════════════════════
+# DEMO MODE — Generate synthetic overlapping images if no
+# real images are provided (for testing the full pipeline)
+# ═══════════════════════════════════════════════════════════
+def create_demo_images():
+    """
+    Create two synthetic overlapping images for demo/testing.
+    Replace image1_path/image2_path with your own images for real use.
+    """
+    print("\n[Demo] Creating synthetic overlapping test images...")
+    np.random.seed(42)
+
+    # Base image with patterns (simulating a real scene)
+    base = np.zeros((512, 768, 3), dtype=np.uint8)
+    # Gradient background
+    for i in range(512):
+        base[i, :] = [int(100 + i*0.3), int(80 + i*0.2), int(60 + i*0.1)]
+
+    # Add rectangles (buildings-like)
+    cv2.rectangle(base, (50, 100), (180, 400), (200, 180, 160), -1)
+    cv2.rectangle(base, (200, 150), (320, 400), (180, 200, 170), -1)
+    cv2.rectangle(base, (350, 80), (500, 400), (160, 160, 200), -1)
+    cv2.rectangle(base, (530, 120), (700, 400), (190, 170, 150), -1)
+
+    # Windows
+    for bx, by, bw, bh in [(50,100,130,300),(200,150,120,250),(350,80,150,320),(530,120,170,280)]:
+        for wy in range(by+20, by+bh-20, 40):
+            for wx in range(bx+10, bx+bw-10, 30):
+                cv2.rectangle(base, (wx, wy), (wx+20, wy+25), (220, 230, 255), -1)
+
+    # Circles (trees/lights)
+    for cx, cy, r, col in [(100,430,30,(30,120,30)),(280,440,25,(20,100,20)),
+                            (450,420,35,(40,130,40)),(620,435,28,(25,110,25))]:
+        cv2.circle(base, (cx, cy), r, col, -1)
+
+    # Text-like features for SIFT
+    for i in range(0, 768, 60):
+        cv2.line(base, (i, 450), (i, 512), (100, 100, 100), 2)
+
+    # Image 1: left portion with overlap
+    img1 = base[:, :512].copy()
+    # Image 2: right portion (with overlap from 256 to 512 of base)
+    img2 = base[:, 256:].copy()
+    img2 = cv2.resize(img2, (512, 512))
+    img1 = cv2.resize(img1, (512, 512))
+
+    # Add slight brightness difference (simulating different illumination — paper §1)
+    img2 = np.clip(img2.astype(np.float32) * 1.1, 0, 255).astype(np.uint8)
+
+    cv2.imwrite("demo_image1.jpg", img1)
+    cv2.imwrite("demo_image2.jpg", img2)
+    print("  demo_image1.jpg and demo_image2.jpg created.")
+    return "demo_image1.jpg", "demo_image2.jpg"
+
+
+# ─────────────────────────────────────────────────────────
+# ENTRY POINT
+# ─────────────────────────────────────────────────────────
+if __name__ == "__main__":
+
+    # ── Option A: Use your OWN images (recommended for mini project)
+    # Set image1_path and image2_path to paths of two overlapping images
+    # e.g. image1_path = "left.jpg"  image2_path = "right.jpg"
+
+    image1_path = "dataset/000271.jpg"  # <── SET YOUR IMAGE PATH HERE
+    image2_path = "dataset/000281.jpg"  # <── SET YOUR IMAGE PATH HERE
+
+    # ── Option B: Auto-generate demo images if paths not set
+    if image1_path is None or image2_path is None:
+        print("[INFO] No image paths provided — using demo synthetic images.")
+        print("[INFO] To use your own images: set image1_path and image2_path in the script.")
+        image1_path, image2_path = create_demo_images()
+
+    run_stitching_pipeline(image1_path, image2_path)

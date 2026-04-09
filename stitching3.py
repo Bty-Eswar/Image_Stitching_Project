@@ -3,8 +3,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 # Load images
-img1 = cv2.imread("dataset/image2.jpg")
-img2 = cv2.imread("dataset/image1.jpg")
+img1 = cv2.imread("dataset/image33.jpg")
+img2 = cv2.imread("dataset/image44.jpg")
 
 # Convert to grayscale
 gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)

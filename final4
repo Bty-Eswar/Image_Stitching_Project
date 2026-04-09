@@ -76,8 +76,8 @@ def feathered_blend(img1, img2, mask1, mask2):
 # ---------------------------------------------------------
 # 1. LOAD IMAGES
 # ---------------------------------------------------------
-img1 = cv2.imread("dataset/image33.jpg")   # Left image
-img2 = cv2.imread("dataset/image44.jpg")   # Right image
+img1 = cv2.imread("dataset/000271.jpg")   # Left image
+img2 = cv2.imread("dataset/000281.jpg")   # Right image
 
 if img1 is None or img2 is None:
     print("Error: Images not found! Check your paths.")
